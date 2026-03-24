@@ -1,0 +1,47 @@
+Windows 到 RK3588 的完整操作清单
+
+1. 在 Windows 上把工程复制到板子
+```powershell
+scp -r E:\rk3588_gui pi@192.168.1.10:/home/pi/Desktop/
+```
+
+2. 登录 RK3588
+```bash
+ssh pi@192.168.1.10
+```
+
+3. 进入工程目录
+```bash
+cd /home/pi/Desktop/rk3588_gui
+```
+
+4. 编译 Qt 程序
+```bash
+qmake rk3588_gui.pro
+make -j4
+```
+
+如果系统里只有 Qt6：
+```bash
+qmake6 rk3588_gui.pro
+make -j4
+```
+
+5. 运行程序
+```bash
+./rk3588_gui
+```
+
+6. 如果 JamSystem 不在默认路径 `/home/pi/Desktop/JamSystem`
+```bash
+export JAMSYSTEM_BASE_PATH=/你的/JamSystem/路径
+export JAMSYSTEM_AD9361_EXE=/你的/JamSystem/路径/ad9361_rk3588
+./rk3588_gui
+```
+
+7. 程序启动后会做什么
+- 你在界面里选择干扰类型
+- 点击“启动采集与识别”
+- Qt 会启动 `ad9361_rk3588 <jam_type> ip:<设备IP>`
+- `ad9361_rk3588` 内部调用 `predict_single.py`
+- Qt 从 `output/live_plot.bin` 读取图像数据并刷新三张图
