@@ -8,6 +8,38 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 
+def add_noise_with_fixed_isr(iq_signal, target_isr_db=30.0, rng=None):
+    """
+    Add complex white Gaussian noise with a fixed input ISR.
+
+    Here ISR is treated as the power ratio between interference/noise and
+    useful signal before any restoration:
+
+        ISR(dB) = 10 * log10(P_noise / P_signal)
+
+    So when target_isr_db is 30 dB, the generated noise power is scaled to be
+    30 dB above the useful signal power.
+    """
+    iq_signal = np.asarray(iq_signal, dtype=np.complex64)
+    if iq_signal.size == 0:
+        return iq_signal
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    signal_power = np.mean(np.abs(iq_signal) ** 2)
+    target_noise_power = signal_power * (10 ** (target_isr_db / 10.0))
+
+    noise = (
+        rng.standard_normal(iq_signal.shape) +
+        1j * rng.standard_normal(iq_signal.shape)
+    ).astype(np.complex64)
+
+    raw_noise_power = np.mean(np.abs(noise) ** 2) + 1e-12
+    noise *= np.sqrt(target_noise_power / raw_noise_power)
+    return iq_signal + noise
+
+
 class IQSTFTAnalyzer:
     """IQ信号的STFT分析器"""
 
@@ -131,9 +163,8 @@ class IQSTFTAnalyzer:
             # 默认：带噪声的复正弦波
             iq_signal = np.exp(1j * 2 * np.pi * f0 * t)
 
-        # 添加高斯噪声
-        noise_power = 0.01
-        iq_signal += np.sqrt(noise_power / 2) * (np.random.randn(n) + 1j * np.random.randn(n))
+        # 添加固定 ISR 的白噪声，满足“原始加噪信号 ISR 固定为 30 dB”。
+        iq_signal = add_noise_with_fixed_isr(iq_signal, target_isr_db=30.0)
 
         return iq_signal
 
@@ -443,9 +474,8 @@ def example_3_simple_real_time():
     phase = 2 * np.pi * np.cumsum(freq_profile) / fs #numpy.cumsum() 用于计算数组元素在指定轴上的累积和，即依次将元素相加并返回中间结果。
     iq_signal = np.exp(1j * phase)
 
-    # 添加噪声
-    noise_power = 0.05
-    iq_signal += np.sqrt(noise_power / 2) * (np.random.randn(n_samples) + 1j * np.random.randn(n_samples))
+    # 添加固定 ISR 的白噪声，避免不同样本间噪声强度漂移。
+    iq_signal = add_noise_with_fixed_isr(iq_signal, target_isr_db=30.0)
 
     # 模拟实时处理
     chunk_size = 1024  # 每次处理的点数
@@ -747,8 +777,8 @@ if __name__ == "__main__":
         t = np.arange(10000) / fs
         iq_signal = np.exp(1j * 2 * np.pi * 100e3 * t)  # 100 kHz信号
 
-        # 添加噪声
-        iq_signal += 0.1 * (np.random.randn(10000) + 1j * np.random.randn(10000))
+        # 添加固定 ISR 的白噪声。
+        iq_signal = add_noise_with_fixed_isr(iq_signal, target_isr_db=30.0)
 
         # STFT分析
         results = analyzer.stft_analysis(iq_signal[:5000])  # 只分析前5000点

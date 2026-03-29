@@ -60,6 +60,9 @@ private:
     QString mapRestoreMethod(const QString &method) const;
     QString mapRestoreStatus(const QString &status) const;
     QString getEngName(int index) const;
+    QString currentModulationArg() const;
+    QString mapModulationToCn(const QString &mode) const;
+    void updateModulationMetricLabels();
 };
 
 #endif // MAINWINDOW_H

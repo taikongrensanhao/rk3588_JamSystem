@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QSharedPointer>
 
@@ -66,6 +67,10 @@ MainWindow::MainWindow(QWidget *parent)
     ui->lineEdit_ip->setText(QString::fromLatin1(kDefaultDeviceIp));
     ui->comboBox_2->setCurrentIndex(0);
     ui->comboBox_2->setEnabled(false);
+    connect(ui->comboBox_modulation,
+            qOverload<int>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) { updateModulationMetricLabels(); });
 
     setupPlotStyles();
     resetPlots();
@@ -99,6 +104,12 @@ void MainWindow::applyUiTextOverrides()
     ui->comboBox_2->setItemText(0, QStringLiteral("AD9361 实时采集"));
     ui->comboBox_2->setItemText(1, QStringLiteral("预留"));
 
+    ui->groupBox_modulation->setTitle(QStringLiteral("调制方式"));
+    ui->comboBox_modulation->setItemText(0, QStringLiteral("数字调制（QPSK）"));
+    ui->comboBox_modulation->setItemText(1, QStringLiteral("模拟调制（FM）"));
+    ui->comboBox_modulation->setItemData(0, QStringLiteral("digital_qpsk"));
+    ui->comboBox_modulation->setItemData(1, QStringLiteral("analog_fm"));
+
     ui->groupBox_2->setTitle(QStringLiteral("干扰样式选择"));
     ui->comboBox->setItemText(0, QStringLiteral("无干扰"));
     ui->comboBox->setItemText(1, QStringLiteral("单频"));
@@ -119,10 +130,15 @@ void MainWindow::applyUiTextOverrides()
     ui->label_metric_isr_title->setText(QStringLiteral("ISR"));
     ui->label_metric_evm_before_title->setText(QStringLiteral("还原前 EVM"));
     ui->label_metric_evm_after_title->setText(QStringLiteral("还原后 EVM"));
+    ui->label_modulation_title->setText(QStringLiteral("调制方式"));
+    ui->label_recognition_time_title->setText(QStringLiteral("识别耗时"));
+    ui->label_restoration_time_title->setText(QStringLiteral("复原耗时"));
 
     ui->groupBox_3->setTitle(QStringLiteral("IQ 波形前后对比"));
     ui->groupBox_5->setTitle(QStringLiteral("星座图前后对比"));
     ui->groupBox_4->setTitle(QStringLiteral("频谱前后对比"));
+
+    updateModulationMetricLabels();
 }
 
 void MainWindow::applyDarkPlotStyle(QCustomPlot *plot, const QString &xLabel, const QString &yLabel)
@@ -233,6 +249,12 @@ void MainWindow::resetMetrics()
     ui->label_metric_isr->setText(QStringLiteral("--"));
     ui->label_metric_evm_before->setText(QStringLiteral("--"));
     ui->label_metric_evm_after->setText(QStringLiteral("--"));
+    ui->label_modulation_value->setText(mapModulationToCn(currentModulationArg()));
+    ui->label_extra_metric1_value->setText(QStringLiteral("--"));
+    ui->label_extra_metric2_value->setText(QStringLiteral("--"));
+    ui->label_recognition_time_value->setText(QStringLiteral("--"));
+    ui->label_restoration_time_value->setText(QStringLiteral("--"));
+    updateModulationMetricLabels();
 }
 
 void MainWindow::updatePlotPresentation()
@@ -276,6 +298,7 @@ void MainWindow::updateRunningState(bool running)
     ui->btnStop->setEnabled(running);
     ui->comboBox->setEnabled(!running);
     ui->lineEdit_ip->setEnabled(!running);
+    ui->comboBox_modulation->setEnabled(!running);
 }
 
 bool MainWindow::refreshRuntimePaths()
@@ -323,6 +346,7 @@ void MainWindow::on_btnStart_clicked()
     }
 
     const QString jamType = getEngName(ui->comboBox->currentIndex());
+    const QString modulationArg = currentModulationArg();
     const QString templateBin = m_basePath + QStringLiteral("/templates/") + jamType + QStringLiteral(".bin");
     if (!QFileInfo::exists(templateBin)) {
         setStatusMessage(QStringLiteral("模板文件不存在：%1").arg(QDir::toNativeSeparators(templateBin)),
@@ -356,12 +380,17 @@ void MainWindow::on_btnStart_clicked()
     resetMetrics();
     updateRunningState(true);
 
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert(QStringLiteral("JAMSYSTEM_MODULATION_MODE"), modulationArg);
+    m_backend->setProcessEnvironment(env);
+
     const QStringList args = {
         jamType,
         uri,
+        modulationArg,
     };
     m_backend->start(m_backendExe, args);
-    setStatusMessage(QStringLiteral("正在启动 AD9361 采集与识别..."), QStringLiteral("#3A7AFE"), 18);
+    setStatusMessage(QStringLiteral("正在启动 AD9361 采集、识别与恢复..."), QStringLiteral("#3A7AFE"), 18);
 }
 
 void MainWindow::on_btnStop_clicked()
@@ -455,6 +484,12 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
         return true;
     }
 
+    if (line.startsWith(QStringLiteral("MODULATION_MODE:"))) {
+        const QString mode = line.section(':', 1).trimmed();
+        ui->label_modulation_value->setText(mapModulationToCn(mode));
+        return true;
+    }
+
     if (line.startsWith(QStringLiteral("RESULT_ID:"))) {
         setStatusMessage(mapIdToCn(line.section(':', 1).trimmed()), QStringLiteral("#FF6B35"), 24, true);
         return true;
@@ -476,6 +511,10 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
             ui->label_metric_isr->setText(QStringLiteral("--"));
             ui->label_metric_evm_before->setText(QStringLiteral("--"));
             ui->label_metric_evm_after->setText(QStringLiteral("--"));
+            ui->label_extra_metric1_value->setText(QStringLiteral("--"));
+            ui->label_extra_metric2_value->setText(QStringLiteral("--"));
+            ui->label_recognition_time_value->setText(QStringLiteral("--"));
+            ui->label_restoration_time_value->setText(QStringLiteral("--"));
         }
         return true;
     }
@@ -505,6 +544,38 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
         if (!m_restoreMetricsSuppressed) {
             ui->label_metric_evm_after->setText(QStringLiteral("%1 %").arg(line.section(':', 1).trimmed()));
         }
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RESTORE_BER_BEFORE:"))) {
+        ui->label_extra_metric1_value->setText(line.section(':', 1).trimmed());
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RESTORE_BER_AFTER:"))) {
+        ui->label_extra_metric2_value->setText(line.section(':', 1).trimmed());
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RESTORE_CORR:"))) {
+        ui->label_extra_metric1_value->setText(line.section(':', 1).trimmed());
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RESTORE_NMSE:"))) {
+        ui->label_extra_metric2_value->setText(QStringLiteral("%1 dB").arg(line.section(':', 1).trimmed()));
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RECOGNITION_TIME_MS:"))) {
+        ui->label_recognition_time_value->setText(
+            QStringLiteral("%1 ms").arg(line.section(':', 1).trimmed()));
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RESTORATION_TIME_MS:"))) {
+        ui->label_restoration_time_value->setText(
+            QStringLiteral("%1 ms").arg(line.section(':', 1).trimmed()));
         return true;
     }
 
@@ -865,4 +936,31 @@ QString MainWindow::getEngName(int index) const
         return names[index];
     }
     return QStringLiteral("none");
+}
+
+QString MainWindow::currentModulationArg() const
+{
+    return ui->comboBox_modulation->currentData().toString();
+}
+
+QString MainWindow::mapModulationToCn(const QString &mode) const
+{
+    if (mode == QStringLiteral("analog_fm")) {
+        return QStringLiteral("模拟调制（FM）");
+    }
+    return QStringLiteral("数字调制（QPSK）");
+}
+
+void MainWindow::updateModulationMetricLabels()
+{
+    const QString mode = currentModulationArg();
+    ui->label_modulation_value->setText(mapModulationToCn(mode));
+
+    if (mode == QStringLiteral("analog_fm")) {
+        ui->label_extra_metric1_title->setText(QStringLiteral("相关系数"));
+        ui->label_extra_metric2_title->setText(QStringLiteral("NMSE"));
+    } else {
+        ui->label_extra_metric1_title->setText(QStringLiteral("恢复前 BER"));
+        ui->label_extra_metric2_title->setText(QStringLiteral("恢复后 BER"));
+    }
 }

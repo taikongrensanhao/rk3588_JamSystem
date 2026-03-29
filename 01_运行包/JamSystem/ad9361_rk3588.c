@@ -1,4 +1,4 @@
-#include <iio.h>
+﻿#include <iio.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -11,7 +11,7 @@
 /* ===================== 1. 配置 ===================== */
 #define RF_FREQUENCY   2480000000ULL
 #define SAMPLING_RATE  6400000
-#define RF_BANDWIDTH   10000000        /* 10MHz，确保宽带信号通过 */
+#define RF_BANDWIDTH   10000000        /* 10MHz，确保宽带信号可以通过 */
 #define LENGTH         40960
 #define WARMUP_FRAMES    20
 #define CAPTURE_INTERVAL 10
@@ -35,6 +35,7 @@ volatile int run_flag = 1;
 int  total_recognitions   = 0;
 int  correct_recognitions = 0;
 char expected_label[64];
+char modulation_mode[64] = "digital_qpsk";
 int  is_none_mode = 0;
 
 void handle_sig(int sig) { run_flag = 0; }
@@ -101,8 +102,8 @@ int check_connectivity(const char *uri) {
 /* ===================== 2. 识别函数 ===================== */
 void run_recognition_and_stat() {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s %s --once %s 2>&1",
-             runtime_python_exe, runtime_predict_script, runtime_captured_file);
+    snprintf(cmd, sizeof(cmd), "JAMSYSTEM_MODULATION_MODE=%s %s %s --once %s 2>&1",
+             modulation_mode, runtime_python_exe, runtime_predict_script, runtime_captured_file);
     FILE *fp = popen(cmd, "r");
     if (!fp) { printf("[ERR] popen failed\n"); return; }
 
@@ -191,7 +192,7 @@ int configure_hardware() {
         printf("[HW] 干扰模式：TX hardwaregain=-3dB  RX manual=70dB\n");
         iio_channel_attr_write_double(p_tx1, "hardwaregain", -3.0);
         iio_channel_attr_write(p_rx1, "gain_control_mode", "manual");
-        iio_channel_attr_write_double(p_rx1, "hardwaregain", 70.0);  /* 30 → 70 */
+        iio_channel_attr_write_double(p_rx1, "hardwaregain", 70.0);  /* 30 -> 70 */
     }
 
     /* 禁用FIR */
@@ -230,8 +231,8 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
 
     if (argc < 2) {
-        printf("用法: %s <jam_type> [ip:x.x.x.x]\n", argv[0]);
-        printf("示例: %s single_tone ip:192.168.1.10\n", argv[0]);
+        printf("用法: %s <jam_type> [ip:x.x.x.x] [digital_qpsk|analog_fm]\n", argv[0]);
+        printf("示例: %s single_tone ip:192.168.1.10 digital_qpsk\n", argv[0]);
         printf("类型: none single_tone narrowband wideband_barrage "
                "comb white_noise noise_fm\n");
         return -1;
@@ -243,12 +244,17 @@ int main(int argc, char **argv) {
 
     init_runtime_paths();
     strncpy(expected_label, argv[1], sizeof(expected_label) - 1);
+    if (argc > 3 && argv[3] && strlen(argv[3]) > 0) {
+        strncpy(modulation_mode, argv[3], sizeof(modulation_mode) - 1);
+    }
     is_none_mode = (strcmp(expected_label, "none") == 0);
     signal(SIGINT, handle_sig);
 
     printf("[INFO] runtime base dir: %s\n", runtime_base_dir);
     printf("[INFO] runtime python: %s\n", runtime_python_exe);
     printf("[INFO] runtime script: %s\n", runtime_predict_script);
+    printf("[INFO] modulation mode: %s\n", modulation_mode);
+    printf("[py] MODULATION_MODE:%s\n", modulation_mode);
 
     /* 加载模板 */
     char path[256];
