@@ -1,4 +1,4 @@
-﻿#include <iio.h>
+#include <iio.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -23,6 +23,8 @@ static char runtime_template_dir[512] = {0};
 static char runtime_captured_file[512] = {0};
 static char runtime_python_exe[512] = {0};
 static char runtime_predict_script[512] = {0};
+static char runtime_useful_qpsk_file[512] = {0};
+static char runtime_useful_bits_file[512] = {0};
 
 struct iio_context *ctx        = NULL;
 struct iio_device  *ad9361_phy = NULL, *tx_dev = NULL, *rx_dev = NULL;
@@ -30,6 +32,7 @@ struct iio_buffer  *rx_buf     = NULL, *tx_buf = NULL;
 struct iio_channel *tx_i = NULL, *tx_q = NULL,
                    *rx_i = NULL, *rx_q = NULL;
 int16_t *jam_template = NULL;
+int16_t *useful_qpsk_template = NULL;
 volatile int run_flag = 1;
 
 int  total_recognitions   = 0;
@@ -37,6 +40,36 @@ int  correct_recognitions = 0;
 char expected_label[64];
 char modulation_mode[64] = "digital_qpsk";
 int  is_none_mode = 0;
+
+static double get_rx_full_scale_dbm(void) {
+    const char *env = getenv("JAMSYSTEM_RX_FS_DBM");
+    if (env && strlen(env) > 0) {
+        char *endptr = NULL;
+        double value = strtod(env, &endptr);
+        if (endptr && endptr != env) {
+            return value;
+        }
+    }
+    return -20.0;
+}
+
+static double estimate_rx_power_dbm(const int16_t *iq_ptr, size_t complex_count) {
+    if (!iq_ptr || complex_count == 0) {
+        return -120.0;
+    }
+
+    const double full_scale_dbm = get_rx_full_scale_dbm();
+    const double fs_ref = 32767.0;
+    double accum = 0.0;
+    for (size_t idx = 0; idx < complex_count; ++idx) {
+        const double i_val = (double)iq_ptr[idx * 2 + 0];
+        const double q_val = (double)iq_ptr[idx * 2 + 1];
+        accum += (i_val * i_val + q_val * q_val) / (2.0 * fs_ref * fs_ref);
+    }
+
+    const double mean_norm_power = accum / (double)complex_count;
+    return full_scale_dbm + 10.0 * log10(mean_norm_power + 1e-12);
+}
 
 void handle_sig(int sig) { run_flag = 0; }
 
@@ -71,6 +104,8 @@ void init_runtime_paths(void) {
 
     snprintf(runtime_template_dir, sizeof(runtime_template_dir), "%s/templates", runtime_base_dir);
     snprintf(runtime_captured_file, sizeof(runtime_captured_file), "%s/output/captured.bin", runtime_base_dir);
+    snprintf(runtime_useful_qpsk_file, sizeof(runtime_useful_qpsk_file), "%s/templates/useful_qpsk.bin", runtime_base_dir);
+    snprintf(runtime_useful_bits_file, sizeof(runtime_useful_bits_file), "%s/templates/useful_qpsk_bits.bin", runtime_base_dir);
 
     if (python_env && strlen(python_env) > 0) {
         snprintf(runtime_python_exe, sizeof(runtime_python_exe), "%s", python_env);
@@ -85,6 +120,96 @@ void init_runtime_paths(void) {
     }
 }
 
+static double get_target_input_jsr_db(void) {
+    const char *env = getenv("JAMSYSTEM_INPUT_JSR_DB");
+    if (env && strlen(env) > 0) {
+        char *endptr = NULL;
+        double value = strtod(env, &endptr);
+        if (endptr && endptr != env) {
+            return value;
+        }
+    }
+    return 30.0;
+}
+
+static int is_digital_qpsk_mode(void) {
+    return strcmp(modulation_mode, "digital_qpsk") == 0;
+}
+
+static double compute_iq_power(const int16_t *iq_ptr, size_t complex_count) {
+    if (!iq_ptr || complex_count == 0) {
+        return 0.0;
+    }
+    double accum = 0.0;
+    for (size_t idx = 0; idx < complex_count; ++idx) {
+        const double i_val = (double)iq_ptr[idx * 2 + 0];
+        const double q_val = (double)iq_ptr[idx * 2 + 1];
+        accum += i_val * i_val + q_val * q_val;
+    }
+    return accum / (double)complex_count;
+}
+
+static int load_iq_template_file(const char *path, int16_t **buffer, size_t expected_count, const char *tag) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        printf("[ERR] 找不到%s: %s\n", tag, path);
+        return -1;
+    }
+
+    int16_t *tmp = (int16_t *)calloc(expected_count, sizeof(int16_t));
+    if (!tmp) {
+        fclose(fp);
+        printf("[ERR] 为%s分配内存失败\n", tag);
+        return -1;
+    }
+
+    size_t nr = fread(tmp, sizeof(int16_t), expected_count, fp);
+    fclose(fp);
+    *buffer = tmp;
+    printf("[INFO] 已加载%s: %s  (%zu 个int16)\n", tag, path, nr);
+    return 0;
+}
+
+static void compose_digital_tx_frame(int16_t *dst, size_t complex_count, int add_jammer) {
+    const double target_jsr_db = get_target_input_jsr_db();
+    const double useful_power = compute_iq_power(useful_qpsk_template, complex_count) + 1e-12;
+    const double jammer_power = compute_iq_power(jam_template, complex_count) + 1e-12;
+    const double jammer_scale = add_jammer ? sqrt((useful_power * pow(10.0, target_jsr_db / 10.0)) / jammer_power) : 0.0;
+
+    for (size_t idx = 0; idx < complex_count; ++idx) {
+        double i_val = (double)useful_qpsk_template[idx * 2 + 0];
+        double q_val = (double)useful_qpsk_template[idx * 2 + 1];
+        if (add_jammer) {
+            i_val += jammer_scale * (double)jam_template[idx * 2 + 0];
+            q_val += jammer_scale * (double)jam_template[idx * 2 + 1];
+        }
+        if (i_val > 32767.0) i_val = 32767.0;
+        if (i_val < -32767.0) i_val = -32767.0;
+        if (q_val > 32767.0) q_val = 32767.0;
+        if (q_val < -32767.0) q_val = -32767.0;
+        dst[idx * 2 + 0] = (int16_t)lrint(i_val);
+        dst[idx * 2 + 1] = (int16_t)lrint(q_val);
+    }
+}
+
+static int fill_tx_buffer_frame(void) {
+    int16_t *tptr = (int16_t *)iio_buffer_start(tx_buf);
+    if (!tptr) {
+        return -1;
+    }
+
+    if (is_digital_qpsk_mode()) {
+        compose_digital_tx_frame(tptr, LENGTH, !is_none_mode);
+        return 0;
+    }
+
+    if (is_none_mode) {
+        memset(tptr, 0, LENGTH * 2 * sizeof(int16_t));
+    } else {
+        memcpy(tptr, jam_template, LENGTH * 2 * sizeof(int16_t));
+    }
+    return 0;
+}
 int check_connectivity(const char *uri) {
     printf("[INFO] checking %s ...\n", uri);
     errno = 0;
@@ -100,21 +225,26 @@ int check_connectivity(const char *uri) {
 }
 
 /* ===================== 2. 识别函数 ===================== */
-void run_recognition_and_stat() {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "JAMSYSTEM_MODULATION_MODE=%s %s %s --once %s 2>&1",
-             modulation_mode, runtime_python_exe, runtime_predict_script, runtime_captured_file);
+void run_recognition_and_stat(double rx_power_dbm) {
+    char cmd[1024];
+    if (is_digital_qpsk_mode()) {
+        snprintf(cmd, sizeof(cmd),
+                 "JAMSYSTEM_MODULATION_MODE=%s JAMSYSTEM_ENABLE_TRUE_BER=1 JAMSYSTEM_QPSK_REF_BITS_FILE=%s %s %s --once %s 2>&1",
+                 modulation_mode, runtime_useful_bits_file, runtime_python_exe, runtime_predict_script, runtime_captured_file);
+    } else {
+        snprintf(cmd, sizeof(cmd), "JAMSYSTEM_MODULATION_MODE=%s %s %s --once %s 2>&1",
+                 modulation_mode, runtime_python_exe, runtime_predict_script, runtime_captured_file);
+    }
     FILE *fp = popen(cmd, "r");
     if (!fp) { printf("[ERR] popen failed\n"); return; }
 
     char  line[1024];
     char  result_id[64] = "";
     float confidence    = 0.0f;
-    long  pwr           = 0;
+
+    printf("[py] RESULT_POWER_DBM:%.2f\n", rx_power_dbm);
 
     while (fgets(line, sizeof(line), fp) != NULL) {
-        if (strstr(line, "DEBUG_POWER:"))
-            sscanf(line, "DEBUG_POWER:%ld", &pwr);
         if (strstr(line, "RESULT_ID:"))
             sscanf(line, "RESULT_ID:%63s", result_id);
         if (strstr(line, "RESULT_CONF:"))
@@ -129,10 +259,10 @@ void run_recognition_and_stat() {
         int ok = (strcmp(result_id, expected_label) == 0);
         if (ok) correct_recognitions++;
         printf("\033[1;%sm[#%d] 预测=%-18s 置信=%.1f%%  "
-               "功率=%ld  累计准确率=%.1f%%\033[0m\n",
+               "功率=%.2f dBm  累计准确率=%.1f%%\033[0m\n",
                ok ? "32" : "31",
                total_recognitions, result_id,
-               confidence * 100.0f, pwr,
+               confidence * 100.0f, rx_power_dbm,
                100.0 * correct_recognitions / total_recognitions);
     }
 }
@@ -217,9 +347,10 @@ int configure_hardware() {
         printf("[ERR] 创建buffer失败\n"); return -1;
     }
 
-    if (is_none_mode) {
-        int16_t *tptr = (int16_t *)iio_buffer_start(tx_buf);
-        if (tptr) memset(tptr, 0, LENGTH * 2 * sizeof(int16_t));
+    if (is_digital_qpsk_mode() || is_none_mode) {
+        if (fill_tx_buffer_frame() < 0) {
+            printf("[ERR] 初始化TX buffer失败\n"); return -1;
+        }
     }
 
     return 0;
@@ -259,15 +390,25 @@ int main(int argc, char **argv) {
     /* 加载模板 */
     char path[256];
     snprintf(path, sizeof(path), "%s/%s.bin", runtime_template_dir, argv[1]);
-    FILE *fp = fopen(path, "rb");
-    if (!fp) { printf("[ERR] 找不到模板: %s\n", path); return -1; }
-    jam_template = malloc(LENGTH * 2 * sizeof(int16_t));
-    if (!jam_template) { fclose(fp); return -1; }
-    size_t nr = fread(jam_template, sizeof(int16_t), LENGTH * 2, fp);
-    fclose(fp);
-    printf("[INFO] 已加载模板: %s  (%zu 个int16)\n", path, nr);
-    if (is_none_mode)
+    if (load_iq_template_file(path, &jam_template, LENGTH * 2, "干扰模板") < 0) {
+        return -1;
+    }
+
+    if (is_digital_qpsk_mode()) {
+        if (load_iq_template_file(runtime_useful_qpsk_file, &useful_qpsk_template, LENGTH * 2, "QPSK参考模板") < 0) {
+            free(jam_template);
+            return -1;
+        }
+        printf("[INFO] 数字调制链路：固定QPSK参考信号发射已启用\n");
+        printf("[INFO] 参考bits文件: %s\n", runtime_useful_bits_file);
+        if (is_none_mode) {
+            printf("[INFO] none模式：发纯净QPSK参考信号，不加干扰\n");
+        } else {
+            printf("[INFO] 干扰模式：QPSK参考信号 + %s 干扰，目标JSR=%.1f dB\n", expected_label, get_target_input_jsr_db());
+        }
+    } else if (is_none_mode) {
         printf("[INFO] none模式：只接收，不发射\n");
+    }
 
     /* 连接ANTSDR */
     const char *uri = (argc > 2) ? argv[2] : "ip:192.168.1.10";
@@ -287,10 +428,10 @@ int main(int argc, char **argv) {
     /* 预热 */
     printf("[INFO] 硬件预热 %d 帧...\n", WARMUP_FRAMES);
     for (int i = 0; i < WARMUP_FRAMES; i++) {
-        if (!is_none_mode) {
-            int16_t *tptr = (int16_t *)iio_buffer_start(tx_buf);
-            if (tptr) memcpy(tptr, jam_template, LENGTH * 2 * sizeof(int16_t));
-            iio_buffer_push(tx_buf);
+        if (is_digital_qpsk_mode() || !is_none_mode) {
+            if (fill_tx_buffer_frame() == 0) {
+                iio_buffer_push(tx_buf);
+            }
         }
         iio_buffer_refill(rx_buf);
     }
@@ -301,13 +442,14 @@ int main(int argc, char **argv) {
     /* 主循环 */
     int frame_cnt = 0;
     while (run_flag) {
-        if (!is_none_mode) {
-            int16_t *tptr = (int16_t *)iio_buffer_start(tx_buf);
-            if (tptr) memcpy(tptr, jam_template, LENGTH * 2 * sizeof(int16_t));
-            ssize_t pushed = iio_buffer_push(tx_buf);
-            if (pushed < 0) {
-                printf("[WARN] TX push 失败: %zd\n", pushed);
-                usleep(10000); continue;
+        if (is_digital_qpsk_mode() || !is_none_mode) {
+            if (fill_tx_buffer_frame() == 0) {
+                ssize_t pushed = iio_buffer_push(tx_buf);
+                if (pushed < 0) {
+                    printf("[WARN] TX push 失败: %zd\n", pushed);
+                    usleep(10000);
+                    continue;
+                }
             }
         }
 
@@ -326,9 +468,10 @@ int main(int argc, char **argv) {
 
             FILE *f = fopen(runtime_captured_file, "wb");
             if (f) {
+                const double rx_power_dbm = estimate_rx_power_dbm(rptr, LENGTH);
                 fwrite(rptr, sizeof(int16_t), LENGTH * 2, f);
                 fclose(f);
-                run_recognition_and_stat();
+                run_recognition_and_stat(rx_power_dbm);
             } else {
                 printf("[ERR] 无法写入 %s\n", runtime_captured_file);
             }
@@ -345,6 +488,22 @@ int main(int argc, char **argv) {
     iio_buffer_destroy(tx_buf);
     iio_buffer_destroy(rx_buf);
     free(jam_template);
+    free(useful_qpsk_template);
     iio_context_destroy(ctx);
     return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

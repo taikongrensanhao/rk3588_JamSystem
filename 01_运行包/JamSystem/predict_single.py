@@ -52,11 +52,25 @@ SPS = 10
 PLOT_POINT_COUNT = 1024
 SPECTRUM_POINT_COUNT = 512
 FAST_PSD_NPERSEG = 2048
+SPECTRUM_FS_DBM = float(os.environ.get("JAMSYSTEM_RX_FS_DBM", "-20.0"))
 FAST_FINE_CFO_GRID = np.linspace(-600, 600, 25, dtype=np.float32)
 FAST_SINGLE_TONE_BANDWIDTHS = (8e3, 12e3)
 FAST_SINGLE_TONE_CUTOFFS = (450e3, 560e3)
 REFINE_DECIMATION = 2
 TORCH_NUM_THREADS = 2
+QPSK_REF_SYMBOL_PERIOD = int(os.environ.get("JAMSYSTEM_QPSK_REF_SYMBOL_PERIOD", "256"))
+QPSK_REF_SEED = int(os.environ.get("JAMSYSTEM_QPSK_REF_SEED", "2026"))
+QPSK_BER_SKIP_SYMBOLS = int(os.environ.get("JAMSYSTEM_QPSK_BER_SKIP_SYMBOLS", "200"))
+QPSK_BER_ALIGN_SYMBOLS = int(os.environ.get("JAMSYSTEM_QPSK_BER_ALIGN_SYMBOLS", "2048"))
+ENABLE_TRUE_BER = os.environ.get("JAMSYSTEM_ENABLE_TRUE_BER", "0").strip().lower() in {"1", "true", "yes", "on"}
+QPSK_REF_BITS_FILE = os.environ.get(
+    "JAMSYSTEM_QPSK_REF_BITS_FILE",
+    os.path.join(CURRENT_DIR, "templates", "useful_qpsk_bits.bin"),
+)
+QPSK_REF_WAVE_FILE = os.environ.get(
+    "JAMSYSTEM_QPSK_REF_WAVE_FILE",
+    os.path.join(CURRENT_DIR, "templates", "useful_qpsk.bin"),
+)
 
 ID_MAP = [
     "none",
@@ -74,6 +88,9 @@ _analyzer = None
 _rrc_filter = None
 _rknn = None
 _model_backend = "torch"
+_qpsk_ref_bits_period = None
+_qpsk_ref_symbols_period = None
+_qpsk_ref_wave_cache = {}
 
 
 def _get_rrc_filter(alpha=0.35, sps=SPS, span=12):
@@ -283,7 +300,11 @@ def _compute_psd(iq_data, fs=FS):
     freqs, psd = signal.welch(chunk, fs, nperseg=SPECTRUM_POINT_COUNT, return_onesided=False)
     freqs = np.fft.fftshift(freqs)
     psd = np.fft.fftshift(psd)
-    return freqs[:SPECTRUM_POINT_COUNT], 10 * np.log10(psd[:SPECTRUM_POINT_COUNT] + 1e-12)
+    psd_db = 10 * np.log10(psd[:SPECTRUM_POINT_COUNT] + 1e-12)
+    frame_peak = max(float(np.max(np.abs(chunk))), 1e-9)
+    frame_peak_dbfs = 20 * np.log10(frame_peak)
+    dbm_offset = SPECTRUM_FS_DBM - frame_peak_dbfs
+    return freqs[:SPECTRUM_POINT_COUNT], psd_db + dbm_offset
 
 
 def _refine_white_noise_vs_wideband(iq_data, label, modulation_mode="digital_qpsk", fs=FS):
@@ -489,6 +510,257 @@ def signal_sync_recovery(iq_data):
     return symbols * np.exp(1j * np.pi / 4)
 
 
+def _get_reference_qpsk_period():
+    """
+    生成固定已知的 QPSK 参考序列。
+
+    只要数字发射链路使用同样的参考序列，接收端就能逐位比较得到真实 BER。
+    """
+    global _qpsk_ref_bits_period, _qpsk_ref_symbols_period
+    if _qpsk_ref_bits_period is not None and _qpsk_ref_symbols_period is not None:
+        return _qpsk_ref_bits_period, _qpsk_ref_symbols_period
+
+    if os.path.exists(QPSK_REF_BITS_FILE):
+        bits = np.fromfile(QPSK_REF_BITS_FILE, dtype=np.int8)
+        if bits.size >= 2:
+            if bits.size % 2 != 0:
+                bits = bits[:-1]
+        else:
+            bits = np.empty(0, dtype=np.int8)
+    else:
+        rng = np.random.default_rng(QPSK_REF_SEED)
+        bit_count = max(2, QPSK_REF_SYMBOL_PERIOD * 2)
+        bits = rng.integers(0, 2, bit_count, dtype=np.int8)
+
+    if bits.size < 2:
+        rng = np.random.default_rng(QPSK_REF_SEED)
+        bit_count = max(2, QPSK_REF_SYMBOL_PERIOD * 2)
+        bits = rng.integers(0, 2, bit_count, dtype=np.int8)
+
+    bit_pairs = bits.reshape(-1, 2)
+    mapping = {
+        (0, 0): 1 + 1j,
+        (0, 1): 1 - 1j,
+        (1, 1): -1 - 1j,
+        (1, 0): -1 + 1j,
+    }
+    symbols = np.array(
+        [mapping[(int(b0), int(b1))] for b0, b1 in bit_pairs],
+        dtype=np.complex64,
+    ) / np.sqrt(2)
+
+    _qpsk_ref_bits_period = bits
+    _qpsk_ref_symbols_period = symbols
+    return _qpsk_ref_bits_period, _qpsk_ref_symbols_period
+
+
+def _hard_decision_qpsk_symbols(symbols):
+    symbols = np.asarray(symbols, dtype=np.complex64)
+    real_part = np.where(np.real(symbols) >= 0.0, 1.0, -1.0)
+    imag_part = np.where(np.imag(symbols) >= 0.0, 1.0, -1.0)
+    return (real_part + 1j * imag_part).astype(np.complex64) / np.sqrt(2)
+
+
+def _hard_decision_qpsk_bits(symbols):
+    symbols = np.asarray(symbols, dtype=np.complex64)
+    bits = np.zeros(symbols.size * 2, dtype=np.int8)
+    bits[0::2] = (np.real(symbols) < 0.0).astype(np.int8)
+    bits[1::2] = (np.imag(symbols) < 0.0).astype(np.int8)
+    return bits
+
+
+def _repeat_reference_qpsk_bits(symbol_count, shift_symbols=0):
+    ref_bits_period, _ = _get_reference_qpsk_period()
+    period_symbols = max(1, len(ref_bits_period) // 2)
+    symbol_indices = (np.arange(symbol_count, dtype=np.int32) + shift_symbols) % period_symbols
+    repeated = np.empty(symbol_count * 2, dtype=np.int8)
+    repeated[0::2] = ref_bits_period[symbol_indices * 2]
+    repeated[1::2] = ref_bits_period[symbol_indices * 2 + 1]
+    return repeated
+
+
+def calculate_true_qpsk_ber(symbols):
+    """
+    基于固定已知 QPSK 参考序列的逐位比较 BER。
+
+    这里会同时搜索：
+    - 4 个象限旋转；
+    - 一个参考周期内的符号移位；
+
+    只有当数字发射链路使用同一份固定参考序列时，该值才代表真实 BER。
+    """
+    symbols = np.asarray(symbols, dtype=np.complex64)
+    if symbols.size == 0:
+        return 1.0
+
+    skip_symbols = min(max(QPSK_BER_SKIP_SYMBOLS, 0), max(symbols.size - 1, 0))
+    usable_symbols = symbols[skip_symbols:]
+    if usable_symbols.size == 0:
+        usable_symbols = symbols
+
+    _, ref_symbols_period = _get_reference_qpsk_period()
+    period_symbols = len(ref_symbols_period)
+    align_symbols = min(len(usable_symbols), max(64, QPSK_BER_ALIGN_SYMBOLS))
+    probe_symbols = usable_symbols[:align_symbols]
+
+    candidate_rotations = [1.0, 1.0j, -1.0, -1.0j]
+    best_rotation = 1.0
+    best_shift = 0
+    best_score = -1e9
+
+    for rotation in candidate_rotations:
+        decided = _hard_decision_qpsk_symbols(probe_symbols * rotation)
+        for shift in range(period_symbols):
+            ref = ref_symbols_period[(np.arange(align_symbols) + shift) % period_symbols]
+            score = float(np.real(np.mean(decided * np.conj(ref))))
+            if score > best_score:
+                best_score = score
+                best_rotation = rotation
+                best_shift = shift
+
+    pred_bits = _hard_decision_qpsk_bits(usable_symbols * best_rotation)
+    ref_bits = _repeat_reference_qpsk_bits(usable_symbols.size, best_shift)
+    compare_len = min(len(pred_bits), len(ref_bits))
+    if compare_len == 0:
+        return 1.0
+    return float(np.mean(pred_bits[:compare_len] != ref_bits[:compare_len]))
+
+
+
+def calculate_true_qpsk_ber_from_iq(iq_samples):
+    """
+    针对固定参考 QPSK 发射链路，直接在 IQ 上估计真实 BER。
+
+    做法：
+    1. RRC 匹配滤波；
+    2. 在 0..SPS-1 内搜索最佳抽样相位；
+    3. 同时尝试原始符号与共轭符号，覆盖硬件常见的 IQ 镜像/反相；
+    4. 对每个候选分支做粗频偏/相位补偿；
+    5. 调用逐位比较 BER，取最小值。
+    """
+    iq_samples = np.asarray(iq_samples, dtype=np.complex64)
+    if iq_samples.size < SPS * 32:
+        return 1.0
+
+    matched = np.convolve(iq_samples, _get_rrc_filter(), mode="same").astype(np.complex64)
+    best_ber = 1.0
+
+    for phase in range(SPS):
+        symbols = matched[phase::SPS]
+        if symbols.size < 64:
+            continue
+
+        for candidate in (symbols, np.conj(symbols)):
+            ber_raw = calculate_true_qpsk_ber(candidate)
+            if ber_raw < best_ber:
+                best_ber = ber_raw
+
+            work = candidate.astype(np.complex64, copy=True)
+            probe = work[: min(len(work), 2048)]
+            if probe.size >= 8:
+                z = probe ** 4
+                delta = np.angle(np.mean(z[1:] * np.conj(z[:-1])) + 1e-12) / 4.0
+                work *= np.exp(-1j * delta * np.arange(len(work), dtype=np.float32))
+                probe = work[: min(len(work), 2048)]
+                phase0 = 0.25 * np.angle(np.mean(probe ** 4) + 1e-12)
+                work *= np.exp(-1j * phase0)
+                ber_corr = calculate_true_qpsk_ber(work)
+                if ber_corr < best_ber:
+                    best_ber = ber_corr
+
+    return float(best_ber)
+
+
+
+def evaluate_true_qpsk_performance_from_iq(iq_samples):
+    """
+    迁移自新复原代码的更严格数字链路评估逻辑。
+
+    核心步骤：
+    1. RRC 匹配滤波；
+    2. 搜索最佳抽样相位；
+    3. 与固定参考 QPSK 序列做移位/旋转对齐；
+    4. 做最小二乘增益与相位校正；
+    5. 直接计算真实 BER 与真实 EVM。
+    """
+    iq_samples = np.asarray(iq_samples, dtype=np.complex64)
+    if iq_samples.size < SPS * 32:
+        return {"ber": 1.0, "evm": 100.0, "symbols": np.array([], dtype=np.complex64)}
+
+    matched = np.convolve(iq_samples, _get_rrc_filter(), mode="same").astype(np.complex64)
+    ref_bits_period, ref_symbols_period = _get_reference_qpsk_period()
+    period_symbols = max(1, len(ref_symbols_period))
+    if period_symbols <= 0:
+        return {"ber": 1.0, "evm": 100.0, "symbols": np.array([], dtype=np.complex64)}
+
+    best_ber = 1.0
+    best_evm = 100.0
+    best_syms_norm = np.array([], dtype=np.complex64)
+
+    for phase in range(SPS):
+        rx_syms = matched[phase::SPS]
+        if rx_syms.size < 64:
+            continue
+
+        for candidate in (rx_syms, np.conj(rx_syms)):
+            work = candidate.astype(np.complex64, copy=True)
+            probe = work[: min(len(work), 2048)]
+            if probe.size >= 8:
+                z = probe ** 4
+                delta = np.angle(np.mean(z[1:] * np.conj(z[:-1])) + 1e-12) / 4.0
+                work *= np.exp(-1j * delta * np.arange(len(work), dtype=np.float32))
+                probe = work[: min(len(work), 2048)]
+                phase0 = 0.25 * np.angle(np.mean(probe ** 4) + 1e-12)
+                work *= np.exp(-1j * phase0)
+
+            align_len = min(len(work), max(256, min(QPSK_BER_ALIGN_SYMBOLS, len(work))))
+            seg_rx = work[:align_len]
+
+            best_shift = 0
+            best_rotation = 1.0
+            best_score = -1.0
+            for rotation in (1.0, 1.0j, -1.0, -1.0j):
+                seg_rot = seg_rx * rotation
+                for shift in range(period_symbols):
+                    ref = ref_symbols_period[(np.arange(align_len) + shift) % period_symbols]
+                    score = float(np.abs(np.vdot(seg_rot, ref)))
+                    if score > best_score:
+                        best_score = score
+                        best_shift = shift
+                        best_rotation = rotation
+
+            rx_aligned = work * best_rotation
+            ref_aligned = ref_symbols_period[(np.arange(len(rx_aligned)) + best_shift) % period_symbols]
+            L = min(len(rx_aligned), len(ref_aligned))
+            if L < 32:
+                continue
+            rx_aligned = rx_aligned[:L]
+            ref_aligned = ref_aligned[:L]
+
+            alpha_c = np.sum(ref_aligned * np.conj(rx_aligned)) / (np.sum(np.abs(rx_aligned) ** 2) + 1e-12)
+            rx_corrected = rx_aligned * alpha_c
+
+            evm = np.sqrt(np.mean(np.abs(rx_corrected - ref_aligned) ** 2) / (np.mean(np.abs(ref_aligned) ** 2) + 1e-12))
+            evm_pct = float(evm * 100.0)
+
+            bits_rx_I = (np.real(rx_corrected) > 0)
+            bits_ref_I = (np.real(ref_aligned) > 0)
+            bits_rx_Q = (np.imag(rx_corrected) > 0)
+            bits_ref_Q = (np.imag(ref_aligned) > 0)
+            errors = np.sum(bits_rx_I != bits_ref_I) + np.sum(bits_rx_Q != bits_ref_Q)
+            ber = float(errors / (2 * len(bits_ref_I)))
+
+            norm_factor = np.sqrt(np.mean(np.abs(ref_aligned) ** 2)) + 1e-12
+            rx_norm = (rx_corrected / norm_factor).astype(np.complex64)
+
+            if ber < best_ber or (abs(ber - best_ber) < 1e-12 and evm_pct < best_evm):
+                best_ber = ber
+                best_evm = evm_pct
+                best_syms_norm = rx_norm
+
+    return {"ber": float(best_ber), "evm": float(best_evm), "symbols": best_syms_norm}
+
+
 def refine_constellation(symbols):
     """
     对恢复出的星座点做软判决拉拽。
@@ -539,10 +811,100 @@ def calculate_isr(raw_iq, clean_iq):
     return 10 * np.log10(raw_power / (clean_power + 1e-12))
 
 
+def _build_reference_qpsk_wave(length):
+    global _qpsk_ref_wave_cache
+    length = int(max(length, 1))
+    cached = _qpsk_ref_wave_cache.get(length)
+    if cached is not None:
+        return cached
+
+    if os.path.exists(QPSK_REF_WAVE_FILE):
+        interleaved = np.fromfile(QPSK_REF_WAVE_FILE, dtype=np.int16)
+        if interleaved.size >= 2 and interleaved.size % 2 == 0:
+            wave = (interleaved[0::2].astype(np.float32) + 1j * interleaved[1::2].astype(np.float32)) / 32767.0
+            if len(wave) >= length:
+                wave = wave[:length]
+            else:
+                repeats = int(np.ceil(length / max(len(wave), 1)))
+                wave = np.tile(wave, repeats)[:length]
+            _qpsk_ref_wave_cache[length] = wave.astype(np.complex64)
+            return _qpsk_ref_wave_cache[length]
+
+    _, ref_symbols = _get_reference_qpsk_period()
+    repeats = int(np.ceil((length + 4 * SPS * 12) / max(len(ref_symbols) * SPS, 1)))
+    symbols_long = np.tile(ref_symbols, repeats)
+    up = np.zeros(len(symbols_long) * SPS, dtype=np.complex64)
+    up[::SPS] = symbols_long
+    shaped = np.convolve(up, _get_rrc_filter(), mode="same").astype(np.complex64)
+    shaped = shaped[:length]
+    shaped = shaped / (np.sqrt(np.mean(np.abs(shaped) ** 2)) + 1e-12)
+    shaped = shaped * 0.08
+    _qpsk_ref_wave_cache[length] = shaped.astype(np.complex64)
+    return _qpsk_ref_wave_cache[length]
+
+
+def _estimate_reference_useful_component(iq_wave):
+    iq_wave = np.asarray(iq_wave, dtype=np.complex64)
+    if iq_wave.size < 64:
+        return None
+
+    ref_wave = _build_reference_qpsk_wave(len(iq_wave))
+    if ref_wave.size != iq_wave.size:
+        return None
+
+    norm = np.sqrt(np.mean(np.abs(iq_wave) ** 2)) + 1e-12
+    wave = iq_wave / norm
+
+    best_score = -1.0
+    best_useful = None
+    n = len(wave)
+    nfft = 1 << int(np.ceil(np.log2(max(1, 2 * n - 1))))
+    wave_fft = np.fft.fft(wave, nfft)
+
+    for candidate in (ref_wave, np.conj(ref_wave)):
+        cand = candidate / (np.sqrt(np.mean(np.abs(candidate) ** 2)) + 1e-12)
+        corr = np.fft.ifft(wave_fft * np.conj(np.fft.fft(cand, nfft)))
+        shift = int(np.argmax(np.abs(corr[:n])))
+        aligned = np.roll(cand, shift)
+        gain = np.vdot(aligned, wave) / (np.vdot(aligned, aligned) + 1e-12)
+        useful = gain * aligned
+        score = float(np.mean(np.abs(useful) ** 2))
+        if score > best_score:
+            best_score = score
+            best_useful = useful.astype(np.complex64)
+
+    if best_useful is None:
+        return None
+    return best_useful * norm
+
+
+def calculate_interference_power_ratio(raw_iq, clean_iq, modulation_mode):
+    """
+    计算“恢复前干扰功率 / 恢复后干扰功率”的值。
+
+    数字调制场景下，利用固定已知 QPSK 参考波形估计有用信号分量，
+    然后把残差视为干扰+噪声，从而计算恢复前后干扰功率比值。
+    模拟调制场景没有固定参考业务波形时，不输出该指标。
+    """
+    if modulation_mode != "digital_qpsk":
+        return None
+
+    raw_useful = _estimate_reference_useful_component(raw_iq)
+    clean_useful = _estimate_reference_useful_component(clean_iq)
+    if raw_useful is None or clean_useful is None:
+        return None
+
+    raw_interference = np.asarray(raw_iq, dtype=np.complex64) - raw_useful
+    clean_interference = np.asarray(clean_iq, dtype=np.complex64) - clean_useful
+    raw_power = np.mean(np.abs(raw_interference) ** 2)
+    clean_power = np.mean(np.abs(clean_interference) ** 2)
+    return raw_power / (clean_power + 1e-12)
+
+
 def estimate_qpsk_ber_from_evm(evm_percent):
     """
     用 EVM 估计 QPSK 的 BER。
-    这是运行时无参考比特场景下的近似指标，用于界面展示。
+    这是无参考比特场景下的近似指标，保留作为兜底工具函数。
     """
     evm_rms = max(float(evm_percent) / 100.0, 1e-4)
     snr_symbol = 1.0 / (evm_rms * evm_rms)
@@ -648,51 +1010,108 @@ def _restore_single_tone(iq_data):
 
 def _restore_white_noise(iq_data):
     """
-    白噪声干扰还原。
+    ????????????????
 
-    白噪声不是几个尖峰，不能靠陷波解决，所以这里采用：
-    - 频域维纳式增益：尽量压制噪声主导的频段；
-    - 频域平滑低通 taper：避免频域硬截断导致振铃；
-    - 时域低通收尾：进一步稳定输出。
-
-    这样做的目标不是把噪声“完全消失”，
-    而是在不把有用信号削得太狠的前提下，让星座和频谱更规整。
+    ??????????????????
+    1. ????????????????????
+    2. ?????????????????
+    3. ????????????
     """
-    spectrum = np.fft.fft(iq_data)
-    freqs = np.fft.fftfreq(iq_data.size, d=1.0 / FS)
+    sos_pre = signal.butter(6, 450e3, btype="low", fs=FS, output="sos")
+    filtered_pre = _apply_sos_filter(sos_pre, iq_data, zero_phase=True).astype(np.complex64)
 
-    passband_edge = 0.7e6
-    transition_edge = 0.95e6
+    spectrum = np.fft.fft(filtered_pre)
+    freqs = np.fft.fftfreq(filtered_pre.size, d=1.0 / FS)
+    signal_power = np.abs(spectrum) ** 2
 
+    passband_edge = 420e3
+    transition_edge = 650e3
     passband_mask = np.abs(freqs) <= passband_edge
     outband_mask = np.abs(freqs) >= transition_edge
-    noise_power = np.mean(np.abs(spectrum[outband_mask]) ** 2) if np.any(outband_mask) else np.mean(np.abs(spectrum) ** 2) * 0.15
-    signal_power = np.abs(spectrum) ** 2
+    transition_mask = (~passband_mask) & (~outband_mask)
+
+    if np.any(outband_mask):
+        noise_power = float(np.median(signal_power[outband_mask]))
+    else:
+        noise_power = float(np.median(signal_power) * 0.12)
+
     wiener_gain = np.maximum(signal_power - noise_power, 0.0) / (signal_power + 1e-12)
+    wiener_gain = np.clip(wiener_gain, 0.08, 1.0)
 
     taper = np.ones_like(freqs, dtype=np.float32)
-    transition_mask = (~passband_mask) & (~outband_mask)
-    taper[outband_mask] = 0.05
+    taper[outband_mask] = 0.04
     if np.any(transition_mask):
-        transition_pos = (np.abs(freqs[transition_mask]) - passband_edge) / (transition_edge - passband_edge)
-        taper[transition_mask] = 0.05 + 0.95 * 0.5 * (1.0 + np.cos(np.pi * transition_pos))
+        transition_pos = (np.abs(freqs[transition_mask]) - passband_edge) / max(transition_edge - passband_edge, 1.0)
+        taper[transition_mask] = 0.04 + 0.96 * 0.5 * (1.0 + np.cos(np.pi * transition_pos))
 
     filtered = np.fft.ifft(spectrum * wiener_gain * taper).astype(np.complex64)
-    sos_lp = signal.butter(4, 650e3, btype="low", fs=FS, output="sos")
-    filtered = _apply_sos_filter(sos_lp, filtered)
-    return filtered.astype(np.complex64), "wiener_lowpass"
+    sos_post = signal.butter(6, 480e3, btype="low", fs=FS, output="sos")
+    filtered = _apply_sos_filter(sos_post, filtered, zero_phase=True)
+    return filtered.astype(np.complex64), "filter_then_wiener"
+
+
+def _restore_wideband_like(iq_data, mode="wideband_barrage"):
+    """
+    ???? / ?????????????????
+
+    ???????????????
+    - ?? STFT ??????????
+    - ?????????
+    - ? noise_fm ??????????
+    """
+    nperseg = 512
+    noverlap = 384
+    f, t, Zxx = signal.stft(iq_data, fs=FS, nperseg=nperseg, noverlap=noverlap, return_onesided=False)
+    power = np.abs(Zxx) ** 2
+
+    if power.size == 0:
+        return iq_data.astype(np.complex64, copy=True), "subband_mask"
+
+    noise_floor = np.percentile(power, 35, axis=1, keepdims=True)
+    gain = np.maximum(power - noise_floor, 0.0) / (power + 1e-12)
+    gain = np.clip(gain, 0.10, 1.0)
+
+    if mode == "noise_fm":
+        passband_edge = 800e3
+        transition_edge = 1050e3
+        post_band = [20e3, 900e3]
+    else:
+        passband_edge = 520e3
+        transition_edge = 820e3
+        post_band = [10e3, 650e3]
+
+    abs_f = np.abs(f)
+    taper = np.ones_like(abs_f, dtype=np.float32)
+    taper[abs_f >= transition_edge] = 0.03
+    transition_mask = (abs_f > passband_edge) & (abs_f < transition_edge)
+    if np.any(transition_mask):
+        transition_pos = (abs_f[transition_mask] - passband_edge) / max(transition_edge - passband_edge, 1.0)
+        taper[transition_mask] = 0.03 + 0.97 * 0.5 * (1.0 + np.cos(np.pi * transition_pos))
+
+    Zxx_clean = Zxx * gain * taper[:, None]
+    _, restored = signal.istft(Zxx_clean, fs=FS, nperseg=nperseg, noverlap=noverlap, input_onesided=False)
+    restored = restored[: iq_data.size].astype(np.complex64)
+
+    magnitude = np.abs(restored)
+    limit = np.median(magnitude) * (3.0 if mode == "wideband_barrage" else 3.5)
+    restored = np.where(magnitude > limit, restored * (limit / (magnitude + 1e-12)), restored)
+
+    sos_bp = signal.butter(4, post_band, btype="bandpass", fs=FS, output="sos")
+    restored = _apply_sos_filter(sos_bp, restored, zero_phase=True)
+    return restored.astype(np.complex64), "subband_mask"
+
 
 
 def restore_signal(iq_data, label):
     """
-    根据识别标签选择对应的还原策略。
+    ????????????????
 
-    当前约定：
-    - none: 不需要还原，直接旁路
-    - white_noise: 频域维纳抑噪 + 低通
-    - single_tone: 多候选单频陷波择优
-    - narrowband / comb: 峰值检测 + 批量带阻
-    - wideband_barrage / noise_fm: 限幅 + 低通 / 带通
+    ?????
+    - none: ??????????
+    - white_noise: ????????????
+    - single_tone: ?????????
+    - narrowband / comb: ???? + ???? + ?????
+    - wideband_barrage / noise_fm: ????? + ??????
     """
     clean = iq_data.astype(np.complex64, copy=True)
     method = "bypass"
@@ -717,27 +1136,21 @@ def restore_signal(iq_data, label):
             nperseg=FAST_PSD_NPERSEG,
         )
         if label == "narrowband":
-            peaks = [freq for freq in peaks if freq < 0.35e6]
+            peaks = [freq for freq in peaks if abs(freq) < 0.35e6]
         bandwidth = 25e3 if label == "comb" else 20e3
         order = 3 if label == "narrowband" else 4
         clean = _apply_notches(clean, peaks, bw_hz=bandwidth, fs=FS, order=order)
-        sos_lp = signal.butter(4, 500e3, btype="low", fs=FS, output="sos")
-        clean = _apply_sos_filter(sos_lp, clean)
-        method = "notch_filter"
+        sos_lp = signal.butter(6, 450e3, btype="low", fs=FS, output="sos")
+        clean = _apply_sos_filter(sos_lp, clean, zero_phase=True)
+        method = "adaptive_notch"
         return clean, method
 
     if label in {"wideband_barrage", "noise_fm"}:
-        magnitude = np.abs(clean)
-        limit = np.median(magnitude) * 3.5
-        clean = np.where(magnitude > limit, clean * (limit / (magnitude + 1e-12)), clean)
-        sos_lp = signal.butter(4, 700e3, btype="low", fs=FS, output="sos")
-        clean = _apply_sos_filter(sos_lp, clean)
-        sos_bp = signal.butter(3, [10e3, 800e3], btype="bandpass", fs=FS, output="sos")
-        clean = _apply_sos_filter(sos_bp, clean)
-        method = "clip_bandpass"
+        clean, method = _restore_wideband_like(clean, mode=label)
         return clean, method
 
     return clean, method
+
 
 
 def _status_from_metrics(label, evm_before, evm_after):
@@ -854,6 +1267,7 @@ def _run_restoration(iq_processed, label, modulation_mode=None):
     else:
         evm_after = calculate_evm(clean_const[200:2200] if len(clean_const) >= 2200 else clean_const)
     isr = calculate_isr(iq_processed, clean_wave)
+    power_ratio = calculate_interference_power_ratio(iq_processed, clean_wave, modulation_mode)
     status = _status_from_metrics(label, evm_before, evm_after)
 
     ber_before = None
@@ -867,8 +1281,23 @@ def _run_restoration(iq_processed, label, modulation_mode=None):
         corr = corrcoef_score(raw_msg, clean_msg)
         nmse = nmse_db(raw_msg, clean_msg)
     else:
-        ber_before = estimate_qpsk_ber_from_evm(evm_before)
-        ber_after = estimate_qpsk_ber_from_evm(evm_after)
+        if ENABLE_TRUE_BER:
+            perf_before = evaluate_true_qpsk_performance_from_iq(iq_processed)
+            perf_after = evaluate_true_qpsk_performance_from_iq(clean_wave)
+            ber_before = perf_before["ber"]
+            ber_after = perf_after["ber"]
+            # ???? EVM ??????? BER ?????? EVM ???? 100%%?
+            if method == "bypass" and perf_before["symbols"].size > 0:
+                raw_const = perf_before["symbols"]
+                clean_const = raw_const.copy()
+            else:
+                if perf_before["symbols"].size > 0:
+                    raw_const = perf_before["symbols"]
+                if perf_after["symbols"].size > 0:
+                    clean_const = perf_after["symbols"]
+        else:
+            ber_before = estimate_qpsk_ber_from_evm(evm_before)
+            ber_after = estimate_qpsk_ber_from_evm(evm_after)
 
     return {
         "clean_wave": clean_wave,
@@ -876,6 +1305,7 @@ def _run_restoration(iq_processed, label, modulation_mode=None):
         "clean_const": clean_const,
         "method": method,
         "isr": isr,
+        "power_ratio": power_ratio,
         "evm_before": evm_before,
         "evm_after": evm_after,
         "status": status,
@@ -959,6 +1389,10 @@ def predict_loop(file_path):
             print(f"RESTORE_METHOD:{restore_info['method']}", flush=True)
             print(f"RESTORE_STATUS:{restore_info['status']}", flush=True)
             print(f"RESTORE_ISR:{restore_info['isr']:.4f}", flush=True)
+            if restore_info["power_ratio"] is None:
+                print("RESTORE_POWER_RATIO:--", flush=True)
+            else:
+                print(f"RESTORE_POWER_RATIO:{restore_info['power_ratio']:.4f}", flush=True)
             print(f"RESTORE_EVM_BEFORE:{restore_info['evm_before']:.4f}", flush=True)
             print(f"RESTORE_EVM_AFTER:{restore_info['evm_after']:.4f}", flush=True)
             if restore_info["modulation_mode"] == "analog_fm":
@@ -976,6 +1410,7 @@ def predict_loop(file_path):
             print("RESTORE_METHOD:fallback", flush=True)
             print("RESTORE_STATUS:error", flush=True)
             print("RESTORE_ISR:0.0000", flush=True)
+            print("RESTORE_POWER_RATIO:1.0000", flush=True)
             print("RESTORE_EVM_BEFORE:100.0000", flush=True)
             print("RESTORE_EVM_AFTER:100.0000", flush=True)
             if modulation_mode == "analog_fm":
@@ -1050,6 +1485,10 @@ def predict_once(file_path):
         print(f"RESTORE_METHOD:{restore_info['method']}", flush=True)
         print(f"RESTORE_STATUS:{restore_info['status']}", flush=True)
         print(f"RESTORE_ISR:{restore_info['isr']:.4f}", flush=True)
+        if restore_info["power_ratio"] is None:
+            print("RESTORE_POWER_RATIO:--", flush=True)
+        else:
+            print(f"RESTORE_POWER_RATIO:{restore_info['power_ratio']:.4f}", flush=True)
         print(f"RESTORE_EVM_BEFORE:{restore_info['evm_before']:.4f}", flush=True)
         print(f"RESTORE_EVM_AFTER:{restore_info['evm_after']:.4f}", flush=True)
         if restore_info["modulation_mode"] == "analog_fm":
@@ -1065,6 +1504,7 @@ def predict_once(file_path):
         print("RESTORE_METHOD:fallback", flush=True)
         print("RESTORE_STATUS:error", flush=True)
         print("RESTORE_ISR:0.0000", flush=True)
+        print("RESTORE_POWER_RATIO:1.0000", flush=True)
         print("RESTORE_EVM_BEFORE:100.0000", flush=True)
         print("RESTORE_EVM_AFTER:100.0000", flush=True)
         if modulation_mode == "analog_fm":
@@ -1089,3 +1529,9 @@ if __name__ == "__main__":
         predict_loop(sys.argv[1])
     else:
         print("Usage: python predict_single.py [--once] <file.bin>")
+
+
+
+
+
+

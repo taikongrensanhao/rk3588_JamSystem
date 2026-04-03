@@ -1,4 +1,4 @@
-#include "mainwindow.h"
+﻿#include "mainwindow.h"
 #include "ui_mainwindow.h"
 
 #include <QDir>
@@ -128,6 +128,8 @@ void MainWindow::applyUiTextOverrides()
     ui->label_restore_status_title->setText(QStringLiteral("还原结论"));
     ui->label_restore_method_title->setText(QStringLiteral("还原方法"));
     ui->label_metric_isr_title->setText(QStringLiteral("ISR"));
+    ui->label_metric_power_ratio_title->setText(QStringLiteral("干扰功率前后比"));
+    ui->label_metric_power_dbm_title->setText(QStringLiteral("接收功率"));
     ui->label_metric_evm_before_title->setText(QStringLiteral("还原前 EVM"));
     ui->label_metric_evm_after_title->setText(QStringLiteral("还原后 EVM"));
     ui->label_modulation_title->setText(QStringLiteral("调制方式"));
@@ -185,7 +187,7 @@ void MainWindow::setupPlotStyles()
     ui->widget_iq->xAxis->setRange(0, kPlotPointCount - 1);
     ui->widget_iq->yAxis->setRange(-1.2, 1.2);
 
-    applyDarkPlotStyle(ui->widget_spec, QStringLiteral("频率 (kHz)"), QStringLiteral("功率 (dB)"));
+    applyDarkPlotStyle(ui->widget_spec, QStringLiteral("频率 (kHz)"), QStringLiteral("功率 (dBm)"));
     ui->widget_spec->addGraph();
     ui->widget_spec->graph(0)->setPen(QPen(QColor(238, 80, 155), 1.4, Qt::DashLine));
     ui->widget_spec->addGraph();
@@ -247,6 +249,8 @@ void MainWindow::resetMetrics()
     ui->label_restore_status->setText(QStringLiteral("--"));
     ui->label_restore_method->setText(QStringLiteral("--"));
     ui->label_metric_isr->setText(QStringLiteral("--"));
+    ui->label_metric_power_ratio->setText(QStringLiteral("--"));
+    ui->label_metric_power_dbm->setText(QStringLiteral("--"));
     ui->label_metric_evm_before->setText(QStringLiteral("--"));
     ui->label_metric_evm_after->setText(QStringLiteral("--"));
     ui->label_modulation_value->setText(mapModulationToCn(currentModulationArg()));
@@ -509,11 +513,11 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
         if (m_restoreMetricsSuppressed) {
             ui->label_restore_method->setText(QStringLiteral("无需还原"));
             ui->label_metric_isr->setText(QStringLiteral("--"));
+            ui->label_metric_power_ratio->setText(QStringLiteral("--"));
             ui->label_metric_evm_before->setText(QStringLiteral("--"));
             ui->label_metric_evm_after->setText(QStringLiteral("--"));
             ui->label_extra_metric1_value->setText(QStringLiteral("--"));
             ui->label_extra_metric2_value->setText(QStringLiteral("--"));
-            ui->label_recognition_time_value->setText(QStringLiteral("--"));
             ui->label_restoration_time_value->setText(QStringLiteral("--"));
         }
         return true;
@@ -533,6 +537,24 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
         return true;
     }
 
+    if (line.startsWith(QStringLiteral("RESTORE_POWER_RATIO:"))) {
+        if (!m_restoreMetricsSuppressed) {
+            const QString value = line.section(':', 1).trimmed();
+            if (value == QStringLiteral("--") || value.isEmpty()) {
+                ui->label_metric_power_ratio->setText(QStringLiteral("--"));
+            } else {
+                ui->label_metric_power_ratio->setText(QStringLiteral("%1 倍").arg(value));
+            }
+        }
+        return true;
+    }
+
+    if (line.startsWith(QStringLiteral("RESULT_POWER_DBM:"))) {
+        ui->label_metric_power_dbm->setText(
+            QStringLiteral("%1 dBm").arg(line.section(':', 1).trimmed()));
+        return true;
+    }
+
     if (line.startsWith(QStringLiteral("RESTORE_EVM_BEFORE:"))) {
         if (!m_restoreMetricsSuppressed) {
             ui->label_metric_evm_before->setText(QStringLiteral("%1 %").arg(line.section(':', 1).trimmed()));
@@ -548,22 +570,30 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
     }
 
     if (line.startsWith(QStringLiteral("RESTORE_BER_BEFORE:"))) {
-        ui->label_extra_metric1_value->setText(line.section(':', 1).trimmed());
+        if (!m_restoreMetricsSuppressed) {
+            ui->label_extra_metric1_value->setText(line.section(':', 1).trimmed());
+        }
         return true;
     }
 
     if (line.startsWith(QStringLiteral("RESTORE_BER_AFTER:"))) {
-        ui->label_extra_metric2_value->setText(line.section(':', 1).trimmed());
+        if (!m_restoreMetricsSuppressed) {
+            ui->label_extra_metric2_value->setText(line.section(':', 1).trimmed());
+        }
         return true;
     }
 
     if (line.startsWith(QStringLiteral("RESTORE_CORR:"))) {
-        ui->label_extra_metric1_value->setText(line.section(':', 1).trimmed());
+        if (!m_restoreMetricsSuppressed) {
+            ui->label_extra_metric1_value->setText(line.section(':', 1).trimmed());
+        }
         return true;
     }
 
     if (line.startsWith(QStringLiteral("RESTORE_NMSE:"))) {
-        ui->label_extra_metric2_value->setText(QStringLiteral("%1 dB").arg(line.section(':', 1).trimmed()));
+        if (!m_restoreMetricsSuppressed) {
+            ui->label_extra_metric2_value->setText(QStringLiteral("%1 dB").arg(line.section(':', 1).trimmed()));
+        }
         return true;
     }
 
@@ -574,8 +604,10 @@ bool MainWindow::handlePythonProtocolLine(const QString &line)
     }
 
     if (line.startsWith(QStringLiteral("RESTORATION_TIME_MS:"))) {
-        ui->label_restoration_time_value->setText(
-            QStringLiteral("%1 ms").arg(line.section(':', 1).trimmed()));
+        if (!m_restoreMetricsSuppressed) {
+            ui->label_restoration_time_value->setText(
+                QStringLiteral("%1 ms").arg(line.section(':', 1).trimmed()));
+        }
         return true;
     }
 
@@ -954,13 +986,25 @@ QString MainWindow::mapModulationToCn(const QString &mode) const
 void MainWindow::updateModulationMetricLabels()
 {
     const QString mode = currentModulationArg();
+    const bool analogMode = (mode == QStringLiteral("analog_fm"));
     ui->label_modulation_value->setText(mapModulationToCn(mode));
+    ui->groupBox_5->setVisible(!analogMode);
 
-    if (mode == QStringLiteral("analog_fm")) {
-        ui->label_extra_metric1_title->setText(QStringLiteral("相关系数"));
-        ui->label_extra_metric2_title->setText(QStringLiteral("NMSE"));
-    } else {
-        ui->label_extra_metric1_title->setText(QStringLiteral("恢复前 BER"));
-        ui->label_extra_metric2_title->setText(QStringLiteral("恢复后 BER"));
+    QString metric1Text = analogMode
+        ? ui->label_extra_metric1_title->property("analogText").toString()
+        : ui->label_extra_metric1_title->property("digitalText").toString();
+    QString metric2Text = analogMode
+        ? ui->label_extra_metric2_title->property("analogText").toString()
+        : ui->label_extra_metric2_title->property("digitalText").toString();
+
+    if (metric1Text.isEmpty()) {
+        metric1Text = analogMode ? QStringLiteral("皮尔逊相关系数") : QStringLiteral("恢复前 BER");
     }
+    if (metric2Text.isEmpty()) {
+        metric2Text = analogMode ? QStringLiteral("NMSE") : QStringLiteral("恢复后 BER");
+    }
+
+    ui->label_extra_metric1_title->setText(metric1Text);
+    ui->label_extra_metric2_title->setText(metric2Text);
 }
+

@@ -20,7 +20,7 @@
       <x>10</x>
       <y>10</y>
       <width>301</width>
-      <height>840</height>
+      <height>811</height>
      </rect>
     </property>
     <layout class="QVBoxLayout" name="verticalLayout_6">
@@ -335,83 +335,111 @@ color: red;</string>
            </widget>
           </item>
           <item row="4" column="0">
-           <widget class="QLabel" name="label_metric_evm_before_title">
+           <widget class="QLabel" name="label_metric_power_ratio_title">
             <property name="text">
-             <string>还原前 EVM</string>
+             <string>干扰功率前后比</string>
             </property>
            </widget>
           </item>
           <item row="4" column="1">
-           <widget class="QLabel" name="label_metric_evm_before">
+           <widget class="QLabel" name="label_metric_power_ratio">
             <property name="text">
              <string>--</string>
             </property>
            </widget>
           </item>
           <item row="5" column="0">
-           <widget class="QLabel" name="label_metric_evm_after_title">
+           <widget class="QLabel" name="label_metric_power_dbm_title">
             <property name="text">
-             <string>还原后 EVM</string>
+             <string>接收功率</string>
             </property>
            </widget>
           </item>
           <item row="5" column="1">
-           <widget class="QLabel" name="label_metric_evm_after">
+           <widget class="QLabel" name="label_metric_power_dbm">
             <property name="text">
              <string>--</string>
             </property>
            </widget>
           </item>
           <item row="6" column="0">
-           <widget class="QLabel" name="label_extra_metric1_title">
+           <widget class="QLabel" name="label_metric_evm_before_title">
             <property name="text">
-             <string>恢复前 BER</string>
+             <string>还原前 EVM</string>
             </property>
            </widget>
           </item>
           <item row="6" column="1">
-           <widget class="QLabel" name="label_extra_metric1_value">
+           <widget class="QLabel" name="label_metric_evm_before">
             <property name="text">
              <string>--</string>
             </property>
            </widget>
           </item>
           <item row="7" column="0">
-           <widget class="QLabel" name="label_extra_metric2_title">
+           <widget class="QLabel" name="label_metric_evm_after_title">
             <property name="text">
-             <string>恢复后 BER</string>
+             <string>还原后 EVM</string>
             </property>
            </widget>
           </item>
           <item row="7" column="1">
-           <widget class="QLabel" name="label_extra_metric2_value">
+           <widget class="QLabel" name="label_metric_evm_after">
             <property name="text">
              <string>--</string>
             </property>
            </widget>
           </item>
           <item row="8" column="0">
-           <widget class="QLabel" name="label_recognition_time_title">
+           <widget class="QLabel" name="label_extra_metric1_title">
             <property name="text">
-             <string>识别耗时</string>
+             <string>恢复前 BER</string>
             </property>
            </widget>
           </item>
           <item row="8" column="1">
-           <widget class="QLabel" name="label_recognition_time_value">
+           <widget class="QLabel" name="label_extra_metric1_value">
             <property name="text">
              <string>--</string>
             </property>
            </widget>
           </item>
           <item row="9" column="0">
+           <widget class="QLabel" name="label_extra_metric2_title">
+            <property name="text">
+             <string>恢复后 BER</string>
+            </property>
+           </widget>
+          </item>
+          <item row="9" column="1">
+           <widget class="QLabel" name="label_extra_metric2_value">
+            <property name="text">
+             <string>--</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="0">
+           <widget class="QLabel" name="label_recognition_time_title">
+            <property name="text">
+             <string>识别耗时</string>
+            </property>
+           </widget>
+          </item>
+          <item row="10" column="1">
+           <widget class="QLabel" name="label_recognition_time_value">
+            <property name="text">
+             <string>--</string>
+            </property>
+           </widget>
+          </item>
+          <item row="11" column="0">
            <widget class="QLabel" name="label_restoration_time_title">
             <property name="text">
              <string>复原耗时</string>
             </property>
            </widget>
           </item>
-          <item row="9" column="1">
+          <item row="11" column="1">
            <widget class="QLabel" name="label_restoration_time_value">
             <property name="text">
              <string>--</string>
@@ -425,13 +453,13 @@ color: red;</string>
      </item>
     </layout>
    </widget>
-   <widget class="QWidget" name="">
+   <widget class="QWidget" name="layoutWidget">
     <property name="geometry">
      <rect>
       <x>330</x>
       <y>10</y>
-      <width>751</width>
-      <height>841</height>
+      <width>721</width>
+      <height>811</height>
      </rect>
     </property>
     <layout class="QVBoxLayout" name="verticalLayout_2">
