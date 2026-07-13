@@ -1,0 +1,7 @@
+format=int16_interleaved_iq
+sample_rate=6400000
+complex_samples=40960
+equivalent_symbol_rate=240000
+fm_deviation_hz=300000
+message_lowpass_cutoff_hz=360000
+note=Analog FM reference uses a 240 kbaud equivalent NRZ baseband message.

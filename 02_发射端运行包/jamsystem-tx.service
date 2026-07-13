@@ -1,0 +1,13 @@
+[Unit]
+Description=JamSystem Transmitter GUI
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/Desktop/run/transmitter_run
+ExecStart=/bin/bash /home/pi/Desktop/run/transmitter_run/autostart_tx_gnome.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

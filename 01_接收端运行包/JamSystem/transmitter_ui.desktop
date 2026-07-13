@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=JamSystem Transmitter
+Name[zh_CN]=干扰发射控制台
+Comment=Start JamSystem transmitter touch UI
+Exec=/home/pi/Desktop/run/JamSystem/start_transmitter_ui.sh
+Terminal=true
+Categories=Utility;

@@ -1,0 +1,24 @@
+本目录是 RK3588 发射端运行包，不含接收端 GUI。
+
+网络地址固定如下：
+- 发射端 RK（SSH/管理地址）：192.168.1.20
+- AD9361（发射后端和发射 GUI 的连接地址）：192.168.1.10
+- 电脑（SSH/XFTP 所在地址）：192.168.1.1
+
+程序中只有 AD9361 地址需要作为设备连接参数，已固定默认值为 192.168.1.10；
+RK 和电脑地址仅用于 SSH/XFTP 连接，不能填到发射 GUI 的“AD9361 地址”输入框。
+
+目录结构：
+- JamSystem/：AD9361 发射后端及发射模板
+- transmitter_qt_gui/：发射端 Qt GUI
+- build_tx.sh：在 RK 上编译后端与发射端 GUI
+- start_tx_gui.sh：手动启动发射端 GUI
+- install_tx_autostart.sh：安装 GNOME/Wayland 用户级自启动
+
+部署到 RK：
+1. 上传整个目录为 /home/pi/Desktop/run/transmitter_run
+2. 在 RK 执行：sed -i 's/\r$//' *.sh && chmod +x *.sh
+3. 执行：./build_tx.sh
+4. 执行：./install_tx_autostart.sh
+
+自启动只打开控制界面，不会自动开始 RF 发射。界面中确认 AD9361 地址后再点击“开始发射”。

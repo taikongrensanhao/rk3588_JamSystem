@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=JamSystem Receiver
+Exec=/home/pi/Desktop/run/receiver_run/auto_start_receiver.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

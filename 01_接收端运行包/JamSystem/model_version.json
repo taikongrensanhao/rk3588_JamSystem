@@ -1,0 +1,32 @@
+{
+  "version": 1782212119,
+  "created_at": "2026-06-23 18:55:19",
+  "model_file": "MobileNetV2_Mixed.pth",
+  "sha256": "b42715e87ea53ac6f5aed2b41824667d4cf8b2b4655f2731b3e688bc2142707c",
+  "size": 9159947,
+  "classes": [
+    "none",
+    "single_tone",
+    "narrowband",
+    "wideband_barrage",
+    "comb",
+    "white_noise",
+    "noise_fm"
+  ],
+  "class_counts": {
+    "none": 0,
+    "single_tone": 400,
+    "narrowband": 500,
+    "wideband_barrage": 400,
+    "comb": 400,
+    "white_noise": 400,
+    "noise_fm": 400
+  },
+  "val_acc": 100.0,
+  "baseline_val_acc": 53.3333,
+  "epochs": 3,
+  "lr": 0.0001,
+  "freeze_features": false,
+  "base_data_dir": "E:\\桌面迁移\\无线电干扰识别与复原交付\\01_运行包\\JamSystem\\dataset_realworld",
+  "realtime_data_dir": "E:\\桌面迁移\\无线电干扰识别与复原交付\\01_运行包\\JamSystem\\dataset_realtime"
+}
